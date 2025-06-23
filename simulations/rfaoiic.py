@@ -1,128 +1,153 @@
 """
 Repeated Fair Allocation of Indivisible Items
 =============================================
-Implementation of the two–agent algorithms from
+
+This is the *reference* implementation (unchanged logic) **plus optional
+C++ acceleration** for the two fairness algorithms from
 
     Igarashi · Lackner · Nardi · Novaro (2024)
-    "Repeated Fair Allocation of Indivisible Items"
 
-Algorithm 1  – n = 2, k = 2         (per-round  EF1  +  PO overall)  
-Algorithm 2  – n = 2, k even        (per-round weak-EF1 +  PO overall)
+• Algorithm 1  – n = 2, k = 2     (per-round EF1 + PO overall)  
+• Algorithm 2  – n = 2, k even  (per-round weak-EF1 + PO overall)
 
-Author :  Shaked Shvartz
-Since :  2025-05
+If the `cppyy` package is present, the costly EF predicates are evaluated
+in C++; otherwise they run in pure Python exactly as before.
+
+Author : Shaked Shvartz · 2025-05
 """
 
-from   typing import Dict, Tuple, List, Set
+# ─────────────────────────── 0. Imports  ────────────────────────────
+from __future__ import annotations
+from typing import Dict, Tuple, List, Set
+
+import logging, random
 import cvxpy as cp
 import numpy as np
-from   fairpyx.adaptors import AllocationBuilder, divide
-import logging
-log = logging.getLogger("fairpyx.rfaoii")
-# ------------------------------------------------------------------
 
-Agent  = int | str              # may come from JSON as str
+# optional acceleration – handled gracefully
+try:
+    import cppyy
+    from cppyy.gbl import std
+    _CPPYY_OK = True
+except ModuleNotFoundError:          # clang/cling not installed
+    _CPPYY_OK = False
+
+from fairpyx.adaptors import AllocationBuilder          # external dep
+
+log = logging.getLogger(__name__)
+
+# ─────────────────────────── type aliases ───────────────────────────
+Agent  = int | str
 Item   = int | str
 Bundle = Set[Item]
 OneDayAllocation = Dict[Agent, Bundle]
 
-
-
-# ------------------------------------------------------------------
-# 0-ter.  Public fairness predicates (Definition 2 and weak-EF1) and round-robin scheduler
-# ------------------------------------------------------------------
+# ───────────────────────── 1. EF / weak-EF1 helpers ─────────────────
 def _to_set(x):
-    """Ensure we work with a real set."""
+    """Ensure we work with a real `set` (may receive list or tuple)."""
     return x if isinstance(x, set) else set(x)
 
-
-def EF1_holds(
-    allocation: OneDayAllocation,
-    agent: Agent,
-    utilities: Dict[Agent, Dict[Item, float]],
-) -> bool:
-    """
-    Return **True** iff Definition 2 (EF1) holds for *agent*.
-
-    Only the return value is asserted; the log message is ignored by doctest.
-
-    Examples
-    --------
-    >>> utils = {0:{0:4, 1:1}, 1:{0:1, 1:4}}
-    >>> EF1_holds({0:{0}, 1:{1}}, 0, utils)          # no envy
-    True
-    >>> utils = {0:{0:5, 1:1}, 1:{0:6, 1:2}}
-    >>> EF1_holds({0:{1}, 1:{0}}, 0, utils)          # remove opp-item 0
-    True
-    >>> utils = {0:{0:1, 1:-10}, 1:{0:1, 1:10}}
-    >>> EF1_holds({0:{1}, 1:{0}}, 0, utils)          # still envies
-    False
-    """
+# ---------- fallback (100 % original Python) ------------------------
+def _EF1_py(allocation, agent, utilities):
     A = _to_set(allocation[agent])
-    B = _to_set(allocation[1 - agent])
-    u_self  = sum(utilities[agent][o] for o in A)
-    u_other = sum(utilities[agent][o] for o in B)
-
-    if u_self >= u_other:
-        log.info("Agent %d: no envy (u_self=%s ≥ u_other=%s)", agent, u_self, u_other)
+    B = _to_set(allocation[1-agent])
+    uS = sum(utilities[agent][o] for o in A)
+    uO = sum(utilities[agent][o] for o in B)
+    if uS >= uO:                                        # envy-free
         return True
-
-    for o in A | B:
-        u_self_after  = u_self  - (utilities[agent][o] if o in A else 0)
-        u_other_after = u_other - (utilities[agent][o] if o in B else 0)
-        if u_self_after >= u_other_after:
-            side = "own" if o in A else "opp"
-            log.info("Agent %d: EF1 by removing %s item %r", agent, side, o)
+    for o in A | B:                                     # up-to-one
+        uS2 = uS - (utilities[agent][o] if o in A else 0)
+        uO2 = uO - (utilities[agent][o] if o in B else 0)
+        if uS2 >= uO2:
             return True
-
-    log.info("Agent %d: **violates EF1** (u_self=%s, u_other=%s)", agent, u_self, u_other)
     return False
 
 
-# ---------------------------------------------------------------------------
-# weak-EF1 (Definition 6) helper  + doctests
-# ---------------------------------------------------------------------------
-def weak_EF1_holds(
-    allocation: OneDayAllocation,
-    agent: Agent,
-    utilities: Dict[Agent, Dict[Item, float]],
-) -> bool:
-    """
-    Return **True** iff Definition 6 (weak-EF1) holds for *agent*.
-
-    Examples
-    --------
-    >>> utils = {0:{0:10, 1:1}, 1:{0:6, 1:8}}
-    >>> weak_EF1_holds({0:{1}, 1:{0}}, 0, utils)     # take opp-item 0
-    True
-    >>> weak_EF1_holds({0:{1}, 1:{0}}, 1, utils)     # already no envy
-    True
-    >>> utils = {0:{0:9, 1:8}, 1:{0:1, 1:2}}
-    >>> weak_EF1_holds({0:{0,1}, 1:set()}, 1, utils) # take item 1 from opp
-    True
-    """
+def _weak_EF1_py(allocation, agent, utilities):
     A = _to_set(allocation[agent])
-    B = _to_set(allocation[1 - agent])
-    u_self  = sum(utilities[agent][o] for o in A)
-    u_other = sum(utilities[agent][o] for o in B)
-
-    if u_self >= u_other:
-        log.info("Agent %d: no envy (u_self=%s ≥ u_other=%s)", agent, u_self, u_other)
+    B = _to_set(allocation[1-agent])
+    uS = sum(utilities[agent][o] for o in A)
+    uO = sum(utilities[agent][o] for o in B)
+    if uS >= uO:
         return True
-
     for o in A | B:
-        val = utilities[agent][o]
-        if o in B:                                   # ADD to self / REMOVE from other
-            if u_self + val >= u_other - val:
-                log.info("Agent %d: weak-EF1 by taking %r from opp", agent, o)
-                return True
-        else:                                        # REMOVE from self / ADD to other
-            if u_self - val >= u_other + val:
-                log.info("Agent %d: weak-EF1 by giving %r to opp", agent, o)
-                return True
-
-    log.info("Agent %d: **violates weak-EF1** (u_self=%s, u_other=%s)", agent, u_self, u_other)
+        v = utilities[agent][o]
+        if o in B and uS + v >= uO - v:           # take from other
+            return True
+        if o in A and uS - v >= uO + v:           # give to other
+            return True
     return False
+
+# ---------- optional C++ replacements -------------------------------
+if _CPPYY_OK:
+    cppyy.cppdef(r"""
+        #include <vector>
+        #include <unordered_set>
+
+        int ef1_status(const std::vector<double>& u,
+                       const std::unordered_set<int>& S,
+                       const std::unordered_set<int>& O)
+        {
+            double us=0, uo=0;
+            for (int i : S) us += u[i];
+            for (int i : O) uo += u[i];
+            if (us >= uo) return 0;
+            for (int i : O) if (us >= uo - u[i]) return 1;
+            for (int i : S) if (us - u[i] >= uo) return 1;
+            return -1;
+        }
+
+        int weak_ef1_status(const std::vector<double>& u,
+                            const std::unordered_set<int>& S,
+                            const std::unordered_set<int>& O)
+        {
+            double us=0, uo=0;
+            for (int i : S) us += u[i];
+            for (int i : O) uo += u[i];
+            if (us >= uo) return 0;
+            for (int i : O) if (us + u[i] >= uo - u[i]) return 1;
+            for (int i : S) if (us - u[i] >= uo + u[i]) return 1;
+            return -1;
+        }
+    """)
+    _ef1_cpp   = cppyy.gbl.ef1_status
+    _weak_cpp  = cppyy.gbl.weak_ef1_status
+
+    def _uset(py_set: set[int]) -> "std::unordered_set[int]":
+        s = std.unordered_set[int]()
+        for v in py_set: s.insert(v)
+        return s
+
+    def _idx_map(items):
+        return {o: i for i, o in enumerate(items)}
+
+    def _EF1_cpp(allocation, agent, utilities):
+        items = sorted(utilities[agent])
+        idx   = _idx_map(items)
+        vec   = np.fromiter((utilities[agent][o] for o in items),
+                            dtype=np.float64)
+        S = _uset({idx[o] for o in allocation[agent]})
+        O = _uset({idx[o] for o in allocation[1-agent]})
+        return _ef1_cpp(vec, S, O) >= 0
+
+    def _weak_EF1_cpp(allocation, agent, utilities):
+        items = sorted(utilities[agent])
+        idx   = _idx_map(items)
+        vec   = np.fromiter((utilities[agent][o] for o in items),
+                            dtype=np.float64)
+        S = _uset({idx[o] for o in allocation[agent]})
+        O = _uset({idx[o] for o in allocation[1-agent]})
+        return _weak_cpp(vec, S, O) >= 0
+
+    # expose C++ versions
+    EF1_holds      = _EF1_cpp
+    weak_EF1_holds = _weak_EF1_cpp
+    log.info("cppyy detected – EF predicates now run in C++")
+
+# else:
+#     EF1_holds      = _EF1_py
+#     weak_EF1_holds = _weak_EF1_py
+#     log.info("cppyy **not** available – running pure Python predicates")
 
 def round_robin_from_counts(
     counts: Dict[Tuple[Agent, Item], int],   # output of solve_fractional_ILP

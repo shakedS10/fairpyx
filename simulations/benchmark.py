@@ -1,5 +1,12 @@
 # benchmark.py  – timing + plots for the two RFAOII algorithms
 # --------------------------------------------------------------------
+from __future__ import annotations
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
+import io, json, logging, urllib.parse
+from contextlib import redirect_stdout, redirect_stderr
+from typing import Any
 from pathlib import Path
 import random, time, logging
 from experiments_csv import Experiment, single_plot_results, multi_plot_results
@@ -60,9 +67,24 @@ BACKUP_DIR.mkdir(exist_ok=True)
 
 exp = Experiment(RESULTS_DIR, "timing.csv", backup_folder=BACKUP_DIR)
 
-sizes  = [3, 6, 12, 24]            # number of items
-seeds  = [0, 1, 2]                 # three RNG seeds
-rounds = [2, 4, 8]                 # rounds for Alg-2   (even only!)
+seed1 = random.randint(0, 10000)
+seed2 = random.randint(0, 10000)
+seed3 = random.randint(0, 10000)
+print(f"\nrandom seed1 {seed1}")
+print(f"\nrandom seed2 {seed2}")
+print(f"\nrandom seed3 {seed3}")
+
+
+
+
+
+
+sizes  = [3, 6, 12, 24, 10000]
+seeds  = [seed1, seed2, seed3]
+rounds = [2, 4, 8]                   # even values only
+
+exp.clear_previous_results()
+
 
 # Algorithm 1  (fixed k = 2)
 exp.run(run_alg, {
@@ -86,7 +108,7 @@ print("✓  Benchmark finished; data in", RESULTS_DIR / "timing.csv")
 PLOTS_DIR = RESULTS_DIR / "plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 
-# ❶  single plot – Algorithm 1
+# single plot – Algorithm 1
 single_plot_results(
     RESULTS_DIR / "timing.csv",
     filter       = {"algorithm": "alg1"},
@@ -97,7 +119,7 @@ single_plot_results(
     save_to_file = str(PLOTS_DIR / "alg1_runtime.png"),      # ← cast to str
 )
 
-# ❷  3-pane plot – Algorithm 2
+#  3-pane plot – Algorithm 2
 multi_plot_results(
     RESULTS_DIR / "timing.csv",
     filter         = {"algorithm": "alg2"},
@@ -112,7 +134,7 @@ multi_plot_results(
 )
 
 
-# ❸ scatter – Algorithm 2, fixed m, varying k (even values only)
+# scatter – Algorithm 2, fixed m, varying k (even values only)
 FIXED_M = 12
 df = pd.read_csv(RESULTS_DIR / "timing.csv")
 df = df[(df["algorithm"] == "alg2") & (df["m"] == FIXED_M)]
